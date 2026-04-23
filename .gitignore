@@ -4,3 +4,7 @@ mvp/tmp/
 # M2 persistence artifacts
 data/
 mvp/data/
+# M3 LSM test artifacts
+data-m3/
+mvp/data-m3/
+mvp/tmp-m3/

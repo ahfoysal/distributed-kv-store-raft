@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/foysal/distkv/internal/kv"
+	"github.com/foysal/distkv/internal/lsm"
 	"github.com/foysal/distkv/internal/raft"
 	"github.com/foysal/distkv/internal/transport"
 )
@@ -21,6 +22,8 @@ func main() {
 	peerList := flag.String("peers", "", "comma-separated id@addr list (excluding self)")
 	dataDir := flag.String("data", "data", "data directory root (per-node subdir is created)")
 	snapshotEvery := flag.Int("snapshot-every", 100, "take a snapshot every N applied entries (0 disables)")
+	lsmFlushBytes := flag.Int("lsm-flush-bytes", 0, "LSM memtable flush threshold in bytes (0 = default 1MiB)")
+	lsmL0Trigger := flag.Int("lsm-l0-trigger", 0, "compact when L0 has this many tables (0 = default 4)")
 	flag.Parse()
 
 	if *id == "" || *addr == "" {
@@ -38,21 +41,35 @@ func main() {
 		}
 	}
 
-	store := kv.New()
 	applyCh := make(chan raft.ApplyMsg, 256)
 	rpc := transport.NewHTTP()
 	node := raft.NewNode(*id, peers, rpc, applyCh)
 
-	// Persistence (M2): one directory per node, containing wal.log, state.json,
-	// and snapshot.json. Load existing state before starting raft loops.
+	// Persistence (M2 + M3): one directory per node, containing wal.log,
+	// state.json, snapshot.json, and an lsm/ subdir with SSTables (M3).
 	nodeDir := filepath.Join(*dataDir, *id)
+	store, err := kv.NewWithOptions(filepath.Join(nodeDir, "lsm"), lsm.Options{
+		FlushThresholdBytes: *lsmFlushBytes,
+		L0Trigger:           *lsmL0Trigger,
+	})
+	if err != nil {
+		log.Fatalf("open kv store: %v", err)
+	}
 	persister, err := raft.NewPersister(nodeDir)
 	if err != nil {
 		log.Fatalf("persister: %v", err)
 	}
 	// Synchronous applier so snapshots always see fully-applied KV state.
 	node.SetApplier(func(cmd string) { store.Apply(cmd) })
-	if err := node.AttachPersistence(persister, *snapshotEvery, store.Snapshot, store.Restore); err != nil {
+	// Wrap Snapshot to flush the LSM memtable first, so a post-snapshot crash
+	// can't leave committed KV state behind a WAL-truncated Raft log.
+	snapshotFn := func() map[string]string {
+		if err := store.Flush(); err != nil {
+			log.Printf("kv flush before snapshot: %v", err)
+		}
+		return store.Snapshot()
+	}
+	if err := node.AttachPersistence(persister, *snapshotEvery, snapshotFn, store.Restore); err != nil {
 		log.Fatalf("attach persistence: %v", err)
 	}
 
