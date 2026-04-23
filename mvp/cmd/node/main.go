@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,6 +19,8 @@ func main() {
 	id := flag.String("id", "", "node id (e.g. n1)")
 	addr := flag.String("addr", "", "listen addr (e.g. 127.0.0.1:9001)")
 	peerList := flag.String("peers", "", "comma-separated id@addr list (excluding self)")
+	dataDir := flag.String("data", "data", "data directory root (per-node subdir is created)")
+	snapshotEvery := flag.Int("snapshot-every", 100, "take a snapshot every N applied entries (0 disables)")
 	flag.Parse()
 
 	if *id == "" || *addr == "" {
@@ -40,9 +43,23 @@ func main() {
 	rpc := transport.NewHTTP()
 	node := raft.NewNode(*id, peers, rpc, applyCh)
 
+	// Persistence (M2): one directory per node, containing wal.log, state.json,
+	// and snapshot.json. Load existing state before starting raft loops.
+	nodeDir := filepath.Join(*dataDir, *id)
+	persister, err := raft.NewPersister(nodeDir)
+	if err != nil {
+		log.Fatalf("persister: %v", err)
+	}
+	// Synchronous applier so snapshots always see fully-applied KV state.
+	node.SetApplier(func(cmd string) { store.Apply(cmd) })
+	if err := node.AttachPersistence(persister, *snapshotEvery, store.Snapshot, store.Restore); err != nil {
+		log.Fatalf("attach persistence: %v", err)
+	}
+
+	// applyCh is unused when an applier is set, but drain it defensively.
 	go func() {
 		for msg := range applyCh {
-			store.Apply(msg.Command)
+			_ = msg
 		}
 	}()
 

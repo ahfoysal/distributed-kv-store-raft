@@ -1,3 +1,6 @@
 mvp/tmp/
 *.log
 /tmp/distkv-node
+# M2 persistence artifacts
+data/
+mvp/data/

@@ -38,6 +38,7 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 		n.votedFor = args.CandidateID
 		n.resetElectionTimer()
 		reply.VoteGranted = true
+		n.persistStateLocked()
 	}
 	reply.Term = n.currentTerm
 	return reply

@@ -37,28 +37,48 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	n.leaderID = args.LeaderID
 	n.resetElectionTimer()
 
-	// Check log consistency
+	// Check log consistency. Slice positions are offset by snapshotLastIdx.
+	base := n.snapshotLastIdx
 	if args.PrevLogIndex > 0 {
-		if args.PrevLogIndex >= len(n.log) {
-			reply.ConflictIndex = len(n.log)
+		prevPos := args.PrevLogIndex - base
+		if prevPos < 0 {
+			// PrevLogIndex is already covered by our snapshot — treat as ok
+			// (caller will trim overlapping entries below).
+		} else if prevPos >= len(n.log) {
+			reply.ConflictIndex = base + len(n.log)
 			return reply
-		}
-		if n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		} else if n.log[prevPos].Term != args.PrevLogTerm {
 			reply.ConflictIndex = args.PrevLogIndex
 			return reply
 		}
 	}
 
 	// Append entries, truncating conflicting suffix
+	changed := false
 	for i, e := range args.Entries {
-		pos := args.PrevLogIndex + 1 + i
+		absPos := args.PrevLogIndex + 1 + i
+		pos := absPos - base
+		if pos <= 0 {
+			continue // already covered by snapshot
+		}
 		if pos < len(n.log) {
 			if n.log[pos].Term != e.Term {
 				n.log = n.log[:pos]
 				n.log = append(n.log, e)
+				changed = true
 			}
 		} else {
 			n.log = append(n.log, e)
+			changed = true
+		}
+	}
+	if changed && n.persister != nil {
+		// Rewrite WAL with entries after the snapshot. This is simpler than
+		// tracking per-entry append vs truncation, and keeps crash recovery
+		// straightforward.
+		tail := n.log[1:] // skip the sentinel (or snapshot-derived) index-0 slot
+		if err := n.persister.RewriteWAL(tail); err != nil {
+			log.Printf("[%s] WAL rewrite error: %v", n.id, err)
 		}
 	}
 
@@ -69,6 +89,7 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		} else {
 			n.commitIndex = last
 		}
+		n.persistStateLocked()
 	}
 
 	reply.Term = n.currentTerm
@@ -117,14 +138,24 @@ func (n *Node) replicateTo(p Peer, term, leaderCommit int) {
 		return
 	}
 	nextIdx := n.nextIndex[p.ID]
-	if nextIdx < 1 {
-		nextIdx = 1
+	if nextIdx < n.snapshotLastIdx+1 {
+		// Follower is behind our snapshot boundary; for M2 we don't implement
+		// InstallSnapshot RPC, so skip — the follower will catch up once a new
+		// entry arrives past the snapshot. This only happens if a follower
+		// was offline across many snapshots.
+		nextIdx = n.snapshotLastIdx + 1
 	}
 	prevIdx := nextIdx - 1
-	prevTerm := n.log[prevIdx].Term
+	prevPos := prevIdx - n.snapshotLastIdx
+	if prevPos < 0 || prevPos >= len(n.log) {
+		n.mu.Unlock()
+		return
+	}
+	prevTerm := n.log[prevPos].Term
 	var entries []LogEntry
-	if nextIdx < len(n.log) {
-		entries = append(entries, n.log[nextIdx:]...)
+	startPos := nextIdx - n.snapshotLastIdx
+	if startPos < len(n.log) {
+		entries = append(entries, n.log[startPos:]...)
 	}
 	args := AppendEntriesArgs{
 		Term:         term,
@@ -166,8 +197,13 @@ func (n *Node) replicateTo(p Peer, term, leaderCommit int) {
 // advanceCommit is called with lock held.
 func (n *Node) advanceCommit() {
 	lastIdx := n.log[len(n.log)-1].Index
+	base := n.snapshotLastIdx
 	for N := lastIdx; N > n.commitIndex; N-- {
-		if n.log[N].Term != n.currentTerm {
+		pos := N - base
+		if pos <= 0 || pos >= len(n.log) {
+			continue
+		}
+		if n.log[pos].Term != n.currentTerm {
 			continue
 		}
 		count := 1 // leader
@@ -179,6 +215,7 @@ func (n *Node) advanceCommit() {
 		if count > (len(n.peers)+1)/2 {
 			n.commitIndex = N
 			log.Printf("[%s] committed up to %d", n.id, N)
+			n.persistStateLocked()
 			break
 		}
 	}
@@ -195,12 +232,24 @@ func (n *Node) applyLoop() {
 			n.mu.Lock()
 			for n.lastApplied < n.commitIndex {
 				n.lastApplied++
-				entry := n.log[n.lastApplied]
-				msg := ApplyMsg{Index: entry.Index, Command: entry.Command}
+				pos := n.lastApplied - n.snapshotLastIdx
+				if pos < 0 || pos >= len(n.log) {
+					n.lastApplied--
+					break
+				}
+				entry := n.log[pos]
+				cmd := entry.Command
+				applier := n.applier
 				n.mu.Unlock()
-				n.applyCh <- msg
+				if applier != nil {
+					applier(cmd)
+				} else {
+					n.applyCh <- ApplyMsg{Index: entry.Index, Command: cmd}
+				}
 				n.mu.Lock()
+				n.sinceLastSnap++
 			}
+			n.maybeSnapshotLocked()
 			n.mu.Unlock()
 		}
 	}
