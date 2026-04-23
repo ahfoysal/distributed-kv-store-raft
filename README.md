@@ -1,4 +1,4 @@
-# 01 — Distributed KV Database
+# Distributed KV Database
 
 **Stack:** Go 1.22 · gRPC · Protobuf · BadgerDB (LSM) · etcd/raft library (study) then self-written · Prometheus · Docker Compose for cluster
 
