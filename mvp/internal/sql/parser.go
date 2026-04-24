@@ -68,6 +68,8 @@ func (p *parser) parseStmt() (Stmt, error) {
 		return p.parseUpdate()
 	case "DELETE":
 		return p.parseDelete()
+	case "ALTER":
+		return p.parseAlter()
 	default:
 		return nil, fmt.Errorf("unsupported statement: %s", p.cur.val)
 	}
@@ -310,6 +312,77 @@ func (p *parser) parseDelete() (Stmt, error) {
 		d.Where = pred
 	}
 	return d, nil
+}
+
+func (p *parser) parseAlter() (Stmt, error) {
+	if err := p.expectKeyword("ALTER"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("TABLE"); err != nil {
+		return nil, err
+	}
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	a := &AlterTable{Table: name}
+	switch {
+	case p.cur.kind == tkKeyword && p.cur.val == "ADD":
+		if err := p.bump(); err != nil {
+			return nil, err
+		}
+		// Optional COLUMN keyword.
+		if p.cur.kind == tkKeyword && p.cur.val == "COLUMN" {
+			if err := p.bump(); err != nil {
+				return nil, err
+			}
+		}
+		col, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		if p.cur.kind != tkKeyword || (p.cur.val != "STRING" && p.cur.val != "INT") {
+			return nil, fmt.Errorf("expected STRING or INT, got %q", p.cur.val)
+		}
+		ty := TypeString
+		if p.cur.val == "INT" {
+			ty = TypeInt
+		}
+		if err := p.bump(); err != nil {
+			return nil, err
+		}
+		a.Op = "add"
+		a.Col = ColumnDef{Name: col, Type: ty}
+		if p.cur.kind == tkKeyword && p.cur.val == "DEFAULT" {
+			if err := p.bump(); err != nil {
+				return nil, err
+			}
+			v, err := p.parseValue()
+			if err != nil {
+				return nil, err
+			}
+			a.HasDef = true
+			a.Default = v
+		}
+	case p.cur.kind == tkKeyword && p.cur.val == "DROP":
+		if err := p.bump(); err != nil {
+			return nil, err
+		}
+		if p.cur.kind == tkKeyword && p.cur.val == "COLUMN" {
+			if err := p.bump(); err != nil {
+				return nil, err
+			}
+		}
+		col, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		a.Op = "drop"
+		a.DropName = col
+	default:
+		return nil, fmt.Errorf("expected ADD or DROP after ALTER TABLE, got %q", p.cur.val)
+	}
+	return a, nil
 }
 
 func (p *parser) parseWhere() (*Predicate, error) {

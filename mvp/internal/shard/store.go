@@ -53,6 +53,10 @@ func OpenShard(dataRoot, id string) (*Shard, error) {
 // Close flushes and releases the underlying KV store.
 func (s *Shard) Close() error { return s.store.Close() }
 
+// Flush pushes the LSM memtable to an L0 SSTable. Used by the backup
+// endpoint so the on-disk state is complete before archiving.
+func (s *Shard) Flush() error { return s.store.Flush() }
+
 // KeyCount returns the current approximate live-key count.
 func (s *Shard) KeyCount() int {
 	s.mu.Lock()

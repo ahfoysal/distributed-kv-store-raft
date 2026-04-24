@@ -241,3 +241,138 @@ M4 MVCC+SSI TEST: PASSED (A committed k=2, B aborted on read-write conflict)
   (the encoder/decoder in `mvcc.go` already implements it).
 - No GC of old versions — every committed version lives until the process
   is restarted and the Raft snapshot truncates the log behind it.
+
+## M5 Status: range sharding + mini SQL (shipped)
+
+`internal/shard/` adds a `Router` that partitions the key space into
+half-open `[start, end)` ranges, each owned by one `Shard` (an LSM-backed
+`kv.Store`). A background rebalancer splits any shard whose key count
+crosses a threshold, at the median key; the shard manifest is persisted
+atomically to `manifest.json`. `internal/sql/` is a tiny SQL frontend
+(`CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`) that compiles
+every statement to KV operations keyed by `t/<table>/<pk>`. The new
+`cmd/sqlnode` binary wires the two layers together behind `/sql`, `/kv/*`,
+`/shards`, and `/shards/split` HTTP endpoints. `scripts/test_m5.sh`
+inserts 10k rows, watches the single shard auto-split into multiple
+shards, and verifies cross-shard point lookups, `BETWEEN` range scans,
+`UPDATE`, and `DELETE`.
+
+### Known limitations (intentional, for M6+)
+- One process, many shards — each shard is a local LSM rather than its
+  own Raft group. The interface is the same; the replication layer can be
+  swapped in later without touching the SQL layer.
+- Splits are synchronous (move keys one-by-one). Real range splits would
+  defer key movement via reference-counted SSTables.
+
+## M6 Status: cross-shard 2PC + online schema change + backup/restore (shipped)
+
+Three additions on top of M5:
+
+| Package                | Role                                                    |
+|------------------------|---------------------------------------------------------|
+| `internal/twopc/`      | Two-phase commit coordinator across shard participants  |
+| `internal/schema/`     | Versioned table catalog for online ADD/DROP COLUMN      |
+| `internal/backup/`     | tarball snapshot + fresh-cluster restore                |
+
+### Cross-shard 2PC (`internal/twopc/`)
+
+- **PREPARE**: the coordinator groups ops by owning shard and writes one
+  durable `prepare(txn_id, commit_ts, ops)` line to each participant's
+  `<data>/<shard>/prepare.log` (fsync on every write).
+- **COMMIT POINT**: the coordinator appends a single
+  `decision(txn_id, outcome, shards)` line to
+  `<data>/decision.log` (fsync). This line is the atomic moment of
+  truth — if it makes it to disk, the txn will commit on every shard.
+- **APPLY**: each participant replays its `ops` against the shard's LSM
+  and appends an `applied` marker. Applies are idempotent.
+- **RECOVERY**: on startup the coordinator walks every participant's
+  prepare log. For every still-pending txn it looks up the decision log:
+  `commit` → replay apply, `abort` or missing → mark aborted. Missing
+  decisions are treated as abort because the coordinator is the sole
+  authority — if it did not write a decision line, no one did.
+
+This gives atomic cross-shard transactions whose durability boundary is
+the `decision.log` fsync: a crash anywhere before that line means abort on
+every shard; a crash anywhere after means commit on every shard.
+
+### Online schema change (`internal/schema/`)
+
+A table is a version chain, not a single schema: each `CREATE TABLE` and
+`ALTER TABLE ADD/DROP COLUMN` appends a new `Version{since, columns,
+dropped}` record. `Table.ActiveAt(ts)` picks the newest version whose
+`since ≤ ts`; `Table.Materialize(raw_row, ts)` projects a stored row into
+the column set visible at `ts`, filling in `Default` values for columns
+the row predates and omitting columns dropped before `ts`. No rewrite of
+on-disk rows is required. The catalog is persisted to
+`<data>/catalog.json` (atomic tmp+rename).
+
+SQL integration: the engine's existing in-memory `TableSchema` mirrors the
+catalog's newest version; `CREATE TABLE` also writes an initial version,
+and `ALTER TABLE ADD/DROP COLUMN` appends a new version. A `/catalog`
+HTTP endpoint exposes the full version chain for inspection.
+
+### Backup / restore (`internal/backup/`)
+
+`backup.Create(dataRoot, outPath)` walks every file under the data root
+(per-shard LSM files, `manifest.json`, every `prepare.log`,
+`decision.log`, `catalog.json`) and writes a gzip-compressed tarball.
+`backup.Restore(tarPath, dataRoot)` extracts the tarball into a fresh
+directory (refuses to overwrite) — pointing a new `sqlnode` at that
+directory brings up a bit-for-bit identical cluster. The sqlnode's
+`/backup` endpoint flushes every shard's memtable to an L0 SSTable before
+archiving so the snapshot is complete without any in-memory state.
+
+### Tests
+
+Unit tests:
+```
+$ go test ./internal/twopc/... ./internal/schema/... ./internal/backup/... -v
+=== RUN   TestTwoPCHappyPath                         PASS
+=== RUN   TestTwoPCRecoveryAppliesAfterCrash         PASS
+=== RUN   TestTwoPCRecoveryAbortsWithoutDecision     PASS
+=== RUN   TestOnlineAddDropColumn                    PASS
+=== RUN   TestCatalogPersistence                     PASS
+=== RUN   TestBackupRestoreRoundTrip                 PASS
+=== RUN   TestRestoreRefusesExistingDir              PASS
+```
+
+Integration test (`scripts/test_m6.sh`) — the end-to-end demo from the
+spec:
+
+```
+=== phase 2: split s0 at "m" so alice(<m) and zoe(>=m) live on different shards ===
+  shards: 2
+=== phase 4: cross-shard 2PC transfer: alice -= 60, zoe += 60 ===
+  response: {"outcome":"commit","txn":"t-...-1"}
+  post-commit: alice=40 zoe=60
+=== phase 5: CRASH-MID-COMMIT: alice -> 10, zoe -> 90 (prepare+decide, skip apply, then kill -9) ===
+  pre-kill (not yet applied): alice=40 zoe=60
+=== phase 6: kill -9 sqlnode and restart ===
+=== phase 7: verify recovery applied the crashed txn on both shards ===
+  post-recovery: alice=10 zoe=90
+=== phase 8: online schema change (ADD COLUMN, DROP COLUMN) ===
+  u1 -> {"columns":["id","name","email"],"rows":[["u1","alice-user",null]]}
+  u2 -> {"columns":["id","name","email"],"rows":[["u2","bob-user","bob@example.com"]]}
+  u2 after DROP name -> {"columns":["id","email"],"rows":[["u2","bob@example.com"]]}
+  schema versions on users: 3
+=== phase 9: backup cluster to tarball ===
+=== phase 10: restore into a fresh cluster, start it, verify state ===
+  restored cluster: alice=10 zoe=90
+  restored schema versions on users: 3
+M6 2PC + SCHEMA CHANGE + BACKUP/RESTORE TEST: PASSED
+```
+
+The critical phases to read are 5→7: we PREPARE on both shards, write the
+global commit decision, then `kill -9` before applying any write. On
+restart the recovery loop sees a committed decision for a prepared txn
+and replays the writes on every participant, giving us atomic cross-shard
+commit across a process crash.
+
+### Known limitations (intentional, for later milestones)
+- The 2PC participants are still local shards inside a single process,
+  not independent Raft groups. The durability + recovery protocol is the
+  same; the RPC fan-out is just elided.
+- No coordinator failover — there is exactly one coordinator. Recovery
+  assumes that the same data directory is re-opened after a crash.
+- Backups are full, not incremental. For the scale of this project that
+  is fine; a future milestone can ship WAL-diff backups on top.

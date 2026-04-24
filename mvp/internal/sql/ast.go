@@ -68,6 +68,19 @@ type Delete struct {
 
 func (*Delete) stmtNode() {}
 
+// AlterTable: ALTER TABLE t ADD COLUMN c TYPE [DEFAULT v]
+//             ALTER TABLE t DROP COLUMN c
+type AlterTable struct {
+	Table    string
+	Op       string // "add" | "drop"
+	Col      ColumnDef
+	HasDef   bool
+	Default  Value
+	DropName string
+}
+
+func (*AlterTable) stmtNode() {}
+
 // Assignment is a single col=val in UPDATE ... SET.
 type Assignment struct {
 	Col string

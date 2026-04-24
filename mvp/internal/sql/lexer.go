@@ -43,6 +43,7 @@ var keywords = map[string]bool{
 	"UPDATE": true, "SET": true, "DELETE": true, "AND": true,
 	"PRIMARY": true, "KEY": true, "STRING": true, "INT": true,
 	"BETWEEN": true,
+	"ALTER": true, "ADD": true, "DROP": true, "COLUMN": true, "DEFAULT": true,
 }
 
 type lexer struct {

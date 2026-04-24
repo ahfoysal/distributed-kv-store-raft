@@ -12,3 +12,12 @@ data-m4/
 tmp-m4/
 data-m5/
 tmp-m5/
+data-m6/
+data-m6-restore/
+tmp-m6/
+mvp/data-m6/
+mvp/data-m6-restore/
+mvp/tmp-m6/
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore

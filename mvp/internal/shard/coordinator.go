@@ -80,6 +80,22 @@ func NewRouter(cfg Config) (*Router, error) {
 	return r, nil
 }
 
+// Manifest returns the router's manifest. Exposed so higher layers (2PC,
+// backup) can introspect the current shard list and look up owners for a
+// key without going through one of the Put/Get/Scan entry points.
+func (r *Router) Manifest() *Manifest { return r.manifest }
+
+// Shard returns the live Shard with id, or nil if no such shard is open.
+// Used by the 2PC coordinator to issue direct writes during apply.
+func (r *Router) Shard(id string) *Shard {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.shards[id]
+}
+
+// DataRoot returns the on-disk directory every shard's data lives under.
+func (r *Router) DataRoot() string { return r.dataRoot }
+
 // Close stops the rebalancer and closes every shard.
 func (r *Router) Close() error {
 	close(r.stopCh)

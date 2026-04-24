@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/foysal/distkv/internal/schema"
 	"github.com/foysal/distkv/internal/shard"
 )
 
@@ -26,6 +27,39 @@ type Engine struct {
 
 	mu     sync.RWMutex
 	tables map[string]*TableSchema
+
+	// Optional: if non-nil, CREATE / ALTER / SELECT also go through the
+	// persistent schema catalog so schema changes survive restarts and are
+	// versioned (M6 online schema change).
+	cat *schema.Catalog
+}
+
+// AttachCatalog wires a persistent schema catalog into the engine. When
+// set, CREATE TABLE also registers an initial Version in the catalog,
+// ALTER TABLE appends a new Version, and SELECT/INSERT/UPDATE use the
+// catalog as the source of truth. Safe to call once at startup, before
+// the engine starts serving requests.
+func (e *Engine) AttachCatalog(cat *schema.Catalog) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cat = cat
+	// Hydrate the in-memory TableSchema map from the persisted catalog so
+	// existing tables survive restart.
+	for _, t := range cat.Snapshot() {
+		v := t.Current()
+		if v == nil {
+			continue
+		}
+		cols := make([]ColumnDef, 0, len(v.Columns))
+		for _, c := range v.Columns {
+			ty := TypeString
+			if c.Type == schema.ColInt {
+				ty = TypeInt
+			}
+			cols = append(cols, ColumnDef{Name: c.Name, Type: ty})
+		}
+		e.tables[t.Name] = &TableSchema{Name: t.Name, Columns: cols, PrimaryKey: t.PrimaryKey}
+	}
 }
 
 // TableSchema is the in-memory catalog entry for one table.
@@ -69,6 +103,8 @@ func (e *Engine) Exec(src string) (*Result, error) {
 		return e.execUpdate(s)
 	case *Delete:
 		return e.execDelete(s)
+	case *AlterTable:
+		return e.execAlter(s)
 	default:
 		return nil, fmt.Errorf("unsupported stmt")
 	}
@@ -95,7 +131,76 @@ func (e *Engine) execCreate(s *CreateTable) (*Result, error) {
 		return nil, fmt.Errorf("primary key column %q not declared", s.PrimaryKey)
 	}
 	e.tables[s.Name] = &TableSchema{Name: s.Name, Columns: s.Columns, PrimaryKey: s.PrimaryKey}
+	if e.cat != nil {
+		cols := make([]schema.Column, 0, len(s.Columns))
+		for _, c := range s.Columns {
+			ty := schema.ColString
+			if c.Type == TypeInt {
+				ty = schema.ColInt
+			}
+			cols = append(cols, schema.Column{Name: c.Name, Type: ty})
+		}
+		if err := e.cat.CreateTable(s.Name, s.PrimaryKey, cols); err != nil {
+			return nil, err
+		}
+	}
 	return &Result{Message: "table " + s.Name + " created"}, nil
+}
+
+func (e *Engine) execAlter(s *AlterTable) (*Result, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ts, ok := e.tables[s.Table]
+	if !ok {
+		return nil, fmt.Errorf("unknown table %s", s.Table)
+	}
+	switch s.Op {
+	case "add":
+		for _, c := range ts.Columns {
+			if c.Name == s.Col.Name {
+				return nil, fmt.Errorf("column %s already exists on %s", s.Col.Name, s.Table)
+			}
+		}
+		ts.Columns = append(ts.Columns, s.Col)
+		if e.cat != nil {
+			ty := schema.ColString
+			if s.Col.Type == TypeInt {
+				ty = schema.ColInt
+			}
+			var def any
+			if s.HasDef {
+				def = valueGo(s.Default)
+			}
+			if err := e.cat.AddColumn(s.Table, schema.Column{Name: s.Col.Name, Type: ty, Default: def}); err != nil {
+				return nil, err
+			}
+		}
+		return &Result{Message: fmt.Sprintf("table %s: added column %s", s.Table, s.Col.Name)}, nil
+	case "drop":
+		if s.DropName == ts.PrimaryKey {
+			return nil, fmt.Errorf("cannot drop primary key column %s", s.DropName)
+		}
+		out := ts.Columns[:0]
+		found := false
+		for _, c := range ts.Columns {
+			if c.Name == s.DropName {
+				found = true
+				continue
+			}
+			out = append(out, c)
+		}
+		if !found {
+			return nil, fmt.Errorf("column %s does not exist on %s", s.DropName, s.Table)
+		}
+		ts.Columns = out
+		if e.cat != nil {
+			if err := e.cat.DropColumn(s.Table, s.DropName); err != nil {
+				return nil, err
+			}
+		}
+		return &Result{Message: fmt.Sprintf("table %s: dropped column %s", s.Table, s.DropName)}, nil
+	}
+	return nil, fmt.Errorf("unknown ALTER op %q", s.Op)
 }
 
 // rowKey encodes (table, pk) → "t/<table>/<pk>".
