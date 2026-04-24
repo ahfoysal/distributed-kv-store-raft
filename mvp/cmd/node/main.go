@@ -12,8 +12,10 @@ import (
 
 	"github.com/foysal/distkv/internal/kv"
 	"github.com/foysal/distkv/internal/lsm"
+	"github.com/foysal/distkv/internal/mvcc"
 	"github.com/foysal/distkv/internal/raft"
 	"github.com/foysal/distkv/internal/transport"
+	"github.com/foysal/distkv/internal/txn"
 )
 
 func main() {
@@ -59,6 +61,23 @@ func main() {
 	if err != nil {
 		log.Fatalf("persister: %v", err)
 	}
+
+	// M4: MVCC store + transaction manager. The MVCC store lives alongside the
+	// regular KV store. Committed MVCC batches are routed through Raft as
+	// Op{Kind:"txn_commit"} entries so every replica replays them in order.
+	mvccStore := mvcc.New()
+	hlc := txn.NewHLC()
+	txnMgr := txn.NewManager(mvccStore, hlc)
+	store.TxnApplier = func(payload []byte) {
+		var batch mvcc.CommitBatch
+		if err := json.Unmarshal(payload, &batch); err != nil {
+			log.Printf("mvcc apply: bad payload: %v", err)
+			return
+		}
+		mvccStore.ApplyCommit(batch)
+		hlc.Update(batch.CommitTS)
+	}
+
 	// Synchronous applier so snapshots always see fully-applied KV state.
 	node.SetApplier(func(cmd string) { store.Apply(cmd) })
 	// Wrap Snapshot to flush the LSM memtable first, so a post-snapshot crash
@@ -67,9 +86,19 @@ func main() {
 		if err := store.Flush(); err != nil {
 			log.Printf("kv flush before snapshot: %v", err)
 		}
-		return store.Snapshot()
+		data := store.Snapshot()
+		// M4: piggy-back MVCC state on the same snapshot map under a reserved
+		// prefix. Restore() uses the inverse routing.
+		mvccStore.EncodeForSnapshot(data)
+		return data
 	}
-	if err := node.AttachPersistence(persister, *snapshotEvery, snapshotFn, store.Restore); err != nil {
+	restoreFn := func(data map[string]string) {
+		// Pull MVCC-prefixed entries out first (DecodeFromSnapshot deletes them
+		// from the map) so store.Restore only sees plain KV pairs.
+		mvccStore.DecodeFromSnapshot(data)
+		store.Restore(data)
+	}
+	if err := node.AttachPersistence(persister, *snapshotEvery, snapshotFn, restoreFn); err != nil {
 		log.Fatalf("attach persistence: %v", err)
 	}
 
@@ -129,6 +158,147 @@ func main() {
 				return
 			}
 			time.Sleep(10 * time.Millisecond)
+		}
+		http.Error(w, "commit timeout", 504)
+	})
+
+	// --- M4: transaction endpoints -----------------------------------------
+	// These are leader-only: the transaction manager/HLC live on the leader,
+	// commits are replicated as Op{Kind:"txn_commit"} entries, and replicas
+	// apply them via store.TxnApplier.
+
+	leaderOnly := func(w http.ResponseWriter) bool {
+		state, _, leader := node.State()
+		if state != raft.Leader {
+			http.Error(w, "not leader, try "+leader, 421)
+			return false
+		}
+		return true
+	}
+
+	mux.HandleFunc("/txn/begin", func(w http.ResponseWriter, r *http.Request) {
+		if !leaderOnly(w) {
+			return
+		}
+		t := txnMgr.Begin()
+		_ = json.NewEncoder(w).Encode(map[string]any{"txn_id": t.ID, "read_ts": t.ReadTS})
+	})
+
+	mux.HandleFunc("/txn/get", func(w http.ResponseWriter, r *http.Request) {
+		if !leaderOnly(w) {
+			return
+		}
+		var body struct{ TxnID, Key string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		v, found, err := txnMgr.Get(body.TxnID, body.Key)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"value": v, "found": found})
+	})
+
+	mux.HandleFunc("/txn/put", func(w http.ResponseWriter, r *http.Request) {
+		if !leaderOnly(w) {
+			return
+		}
+		var body struct{ TxnID, Key, Value string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if err := txnMgr.Put(body.TxnID, body.Key, body.Value); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/txn/delete", func(w http.ResponseWriter, r *http.Request) {
+		if !leaderOnly(w) {
+			return
+		}
+		var body struct{ TxnID, Key string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if err := txnMgr.Delete(body.TxnID, body.Key); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/txn/abort", func(w http.ResponseWriter, r *http.Request) {
+		if !leaderOnly(w) {
+			return
+		}
+		var body struct{ TxnID string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if err := txnMgr.Abort(body.TxnID); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"aborted": true})
+	})
+
+	mux.HandleFunc("/txn/commit", func(w http.ResponseWriter, r *http.Request) {
+		if !leaderOnly(w) {
+			return
+		}
+		var body struct{ TxnID string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		batch, committed, err := txnMgr.Commit(body.TxnID)
+		if err != nil {
+			// Aborted-due-to-conflict is a 409. Other errors (unknown txn) are 400.
+			if err == txn.ErrAborted {
+				_ = json.NewEncoder(w).Encode(map[string]any{"committed": false, "reason": err.Error()})
+				return
+			}
+			http.Error(w, err.Error(), 400)
+			return
+		}
+
+		// Read-only transactions still need a response but bypass Raft.
+		if !committed || len(batch.Writes) == 0 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"committed": true, "commit_ts": batch.CommitTS, "writes": 0})
+			return
+		}
+
+		payload, _ := json.Marshal(batch)
+		cmd := kv.EncodeTxnCommit(payload)
+		idx, term, isLeader := node.Propose(cmd)
+		if !isLeader {
+			_, _, leader := node.State()
+			http.Error(w, "not leader, try "+leader, 421)
+			return
+		}
+		// Wait briefly for commit to be applied (we detect via a new version
+		// appearing at commit_ts on any one of the written keys).
+		probeKey := batch.Writes[0].Key
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if mvccStore.LastCommitTS(probeKey) >= batch.CommitTS {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"committed": true,
+					"commit_ts": batch.CommitTS,
+					"writes":    len(batch.Writes),
+					"index":     idx,
+					"term":      term,
+				})
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
 		http.Error(w, "commit timeout", 504)
 	})

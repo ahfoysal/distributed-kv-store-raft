@@ -159,3 +159,85 @@ unchanged, confirming the LSM swap did not regress WAL / snapshot recovery.
   hundreds of thousands of keys, not for a serious workload.
 - No WAL inside the LSM itself; durability of un-flushed memtable writes
   comes from Raft's WAL above us.
+
+## M4 Status: MVCC + SSI transactions (shipped)
+
+Adds multi-version concurrency control and optimistic serializable snapshot
+isolation on top of the Raft-replicated state machine. Clients now have a
+first-class transaction API (`/txn/begin`, `/txn/get`, `/txn/put`,
+`/txn/delete`, `/txn/commit`, `/txn/abort`) with strong isolation guarantees.
+
+### Package layout
+| Path                    | Role                                                               |
+|-------------------------|--------------------------------------------------------------------|
+| `internal/mvcc/mvcc.go` | Key → `[(commit_ts, value|tombstone), ...]` store; `GetAt(key, ts)`; SSI conflict helpers |
+| `internal/txn/hlc.go`   | Hybrid logical clock: 48 bits physical ms, 16 bits counter         |
+| `internal/txn/manager.go` | Txn lifecycle: `Begin`/`Get`/`Put`/`Delete`/`Commit`/`Abort` with OCC validation |
+| `cmd/node/main.go`      | Wires MVCC+txn into Raft; adds the `/txn/*` HTTP endpoints         |
+| `internal/kv/store.go`  | New `Op{Kind:"txn_commit"}` routes replicated batches to MVCC      |
+
+### Protocol
+- **BEGIN**: allocate `read_ts = HLC.Now()`, return txn id.
+- **GET**: record key in the txn's read set, return
+  `store.GetAt(key, read_ts)` — the newest version whose commit timestamp
+  is ≤ `read_ts`. Reads honor read-your-own-writes through the buffered
+  write set.
+- **PUT / DELETE**: buffered in the write set; invisible to other txns.
+- **COMMIT**: allocate `commit_ts = HLC.Now()`. SSI validation: for every key
+  the txn read (and every key it writes), require that no committed version
+  exists with commit timestamp in `(read_ts, commit_ts]`. If validation
+  passes, propose a `txn_commit` entry through Raft; every replica applies
+  it via `store.TxnApplier`, which calls `mvcc.Store.ApplyCommit`.
+  Otherwise return `{"committed":false}`.
+- **ABORT**: drop buffered state.
+
+### Durability & replication
+Commits replicate through the existing Raft log — the new kv `Op` kind
+`txn_commit` carries the MVCC `CommitBatch` as its payload. Followers apply
+it exactly the way they apply `set`/`delete`. Snapshots are extended: the
+MVCC store serializes every `(user_key, commit_ts) → version` pair into the
+Raft snapshot map under a reserved `\x01mvcc\x00` prefix, and the restore
+path reassembles version lists before handing the remaining plain pairs to
+the LSM.
+
+### Tests
+
+Unit tests in `internal/txn/manager_test.go`:
+```
+$ go test ./internal/txn/... -v
+=== RUN   TestBasicCommit            PASS
+=== RUN   TestSnapshotIsolation      PASS
+=== RUN   TestSSIConflict            PASS
+=== RUN   TestConcurrentSSI          PASS  (24 committed, 26 aborted of 50)
+=== RUN   TestReadPhantomConflict    PASS
+=== RUN   TestSnapshotRoundTrip      PASS
+ok  github.com/foysal/distkv/internal/txn  0.47s
+```
+
+Integration test (`scripts/test_m4.sh`) — the concurrent-txn scenario from
+the M4 spec, verified end-to-end over HTTP against a 3-node cluster:
+```
+=== phase 3: begin two concurrent txns A and B ===
+=== phase 4: both read k ===
+  A read -> {"found":true,"value":"1"}
+  B read -> {"found":true,"value":"1"}
+=== phase 5: A writes k=2 and commits ===
+  A commit -> {"commit_ts":116454935796711424,"committed":true,"index":2,"term":1,"writes":1}
+=== phase 6: B writes k=3 and tries to commit (expect ABORT) ===
+  B commit -> {"committed":false,"reason":"txn aborted: serialization conflict (SSI)"}
+=== phase 7: verify final value is 2 ===
+  fresh read -> {"found":true,"value":"2"}
+M4 MVCC+SSI TEST: PASSED (A committed k=2, B aborted on read-write conflict)
+```
+
+### Known limitations (intentional, for later milestones)
+- The transaction manager and HLC live on the leader only. A leader change
+  with in-flight transactions drops them; we return 421 for every `/txn/*`
+  request that does not arrive at the leader. A future milestone can push
+  the txn coordinator onto a quorum-committed state.
+- MVCC state lives in an in-memory map; on-disk representation only exists
+  via the Raft snapshot encoding. A future milestone can persist MVCC
+  versions directly into the LSM using the `user_key | reverseTS` scheme
+  (the encoder/decoder in `mvcc.go` already implements it).
+- No GC of old versions — every committed version lives until the process
+  is restarted and the Raft snapshot truncates the log behind it.

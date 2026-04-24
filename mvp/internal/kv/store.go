@@ -15,14 +15,23 @@ import (
 )
 
 type Op struct {
-	Kind  string `json:"kind"` // "set" | "delete"
-	Key   string `json:"key"`
+	Kind  string `json:"kind"` // "set" | "delete" | "txn_commit"
+	Key   string `json:"key,omitempty"`
 	Value string `json:"value,omitempty"`
+	// TxnPayload carries a JSON-encoded mvcc.CommitBatch when Kind == "txn_commit".
+	// We keep it opaque here to avoid a dependency on internal/mvcc from the
+	// base kv package (the applier in main.go decodes and routes it).
+	TxnPayload json.RawMessage `json:"txn,omitempty"`
 }
 
 // Store is the KV state machine backed by an LSM.
 type Store struct {
 	db *lsm.DB
+
+	// TxnApplier, if set, is invoked for Op{Kind:"txn_commit"} commands. It
+	// receives the opaque TxnPayload (an mvcc.CommitBatch). Set by main.go when
+	// MVCC is wired in.
+	TxnApplier func(payload []byte)
 }
 
 // New opens (or creates) an LSM-backed KV store at dir. Passing "" returns an
@@ -67,6 +76,10 @@ func (s *Store) Apply(command string) {
 		if err := s.db.Delete(op.Key); err != nil {
 			log.Printf("kv.Apply delete %q: %v", op.Key, err)
 		}
+	case "txn_commit":
+		if s.TxnApplier != nil {
+			s.TxnApplier([]byte(op.TxnPayload))
+		}
 	}
 }
 
@@ -77,6 +90,12 @@ func EncodeSet(key, value string) string {
 
 func EncodeDelete(key string) string {
 	b, _ := json.Marshal(Op{Kind: "delete", Key: key})
+	return string(b)
+}
+
+// EncodeTxnCommit wraps a serialized mvcc.CommitBatch as a Raft command.
+func EncodeTxnCommit(payload []byte) string {
+	b, _ := json.Marshal(Op{Kind: "txn_commit", TxnPayload: json.RawMessage(payload)})
 	return string(b)
 }
 
